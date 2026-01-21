@@ -1,0 +1,1 @@
+streamlit pyyaml python-docx
