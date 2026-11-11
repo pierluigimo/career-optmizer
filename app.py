@@ -2,6 +2,7 @@ import streamlit as st
 import yaml
 import re
 import os
+import unicodedata
 import urllib.parse
 from docx import Document
 from docx.shared import Pt
@@ -99,31 +100,351 @@ it:
 """
 
 # --- LOGICA DI BUSINESS ---
+
+# I marker sono parole intere (token), non sottostringhe: "per" in inglese
+# ("per annum") non deve più sbagliare la lingua, e "e" italiano non deve
+# essere confuso con una lettera dentro un'altra parola.
+EN_MARKERS = {
+    'the', 'and', 'to', 'of', 'with', 'we', 'are', 'our', 'will', 'you', 'your',
+    'role', 'team', 'company', 'experience', 'required', 'requirements', 'skills',
+    'responsibilities', 'salary', 'benefits', 'apply', 'about', 'who', 'seeking',
+    'hiring', 'position', 'join', 'us', 'work', 'candidate', 'employer', 'job',
+    'business', 'opportunity', 'including', 'knowledge', 'ability', 'must',
+    'preferred', 'reports', 'reporting', 'lead', 'manage', 'strategy',
+}
+
+IT_MARKERS = {
+    'il', 'lo', 'gli', 'la', 'le', 'di', 'del', 'della', 'dei', 'delle', 'nel',
+    'nella', 'alla', 'alle', 'un', 'una', 'che', 'per', 'con', 'e', 'si', 'siamo',
+    'stiamo', 'cerca', 'cerchiamo', 'ricerca', 'ricercasi', 'posizione', 'ruolo',
+    'azienda', 'requisiti', 'competenze', 'esperienza', 'offriamo', 'offerta',
+    'contratto', 'settore', 'responsabilita', 'assumiamo', 'profilo', 'candidatura',
+}
+
+
+def _strip_accents(text):
+    """Rimuove i diacritici: 'sostenibilita' deve combaciare con 'sostenibilità'."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
+def _norm(text):
+    """Versione normalizzata e case-insensitive per i confronti testuali."""
+    return _strip_accents(text.lower())
+
+
 def detect_language(text):
-    text = text.lower()
-    score_en = sum(text.count(w) for w in [' the ', ' and ', ' to ', ' requirements ', ' we are '])
-    score_it = sum(text.count(w) for w in [' il ', ' e ', ' per ', ' requisiti ', ' siamo '])
-    return 'it' if score_it > score_en else 'en'
+    """Rileva la lingua dell'annuncio contando i marker come parole intere."""
+    tokens = re.findall(r"[a-zA-Zà-ÿ']+", _norm(text))
+    counts = {}
+    for t in tokens:
+        counts[t] = counts.get(t, 0) + 1
+    score_en = sum(counts.get(w, 0) for w in EN_MARKERS)
+    score_it = sum(counts.get(w, 0) for w in IT_MARKERS)
+    if score_it > score_en:
+        return 'it'
+    if score_en > score_it:
+        return 'en'
+    # Pareggio: una JD italiana senza marker espliciti si riconosce dai diacritici
+    # o da parole che non esistono in inglese.
+    if re.search(r"[àèéìòù]", text.lower()) and re.search(
+            r"\b(siamo|stiamo|cerchiamo|ricerca|azienda|offriamo)\b", _norm(text)):
+        return 'it'
+    return 'en'
+
+
+# Titoli riconosciuti, per lingua. L'ordine conta: i titoli piu' specifici
+# vengono testati prima di quelli generici.
+ROLE_PATTERNS = {
+    'en': [
+        (r"\bchief financial officer\b", "Chief Financial Officer"),
+        (r"\bcfo\b", "CFO"),
+        (r"\bfinance director\b", "Finance Director"),
+        (r"\bdirector of finance\b", "Finance Director"),
+        (r"\bgroup financial controller\b", "Group Financial Controller"),
+        (r"\bhead of finance\b", "Head of Finance"),
+        (r"\bhead of financial control\b", "Head of Financial Control"),
+        (r"\bvice president of finance\b", "VP Finance"),
+        (r"\bvp,? (?:of )?finance\b", "VP Finance"),
+        (r"\bsenior finance manager\b", "Senior Finance Manager"),
+        (r"\bfinance manager\b", "Finance Manager"),
+        (r"\bfinancial controller\b", "Financial Controller"),
+    ],
+    'it': [
+        (r"\bdirettore amministrativo e finanziario\b", "Direttore Amministrativo e Finanziario"),
+        (r"\bdirettore finanziario\b", "Direttore Finanziario"),
+        (r"\bdirettore finance\b", "Direttore Finanziario"),
+        (r"\bresponsabile amministrativo e finanziario\b", "Responsabile Amministrativo e Finanziario"),
+        (r"\bresponsabile finanza\b", "Responsabile Finanza"),
+        (r"\bresponsabile finance\b", "Responsabile Finanza"),
+        (r"\bchief financial officer\b", "CFO"),
+        (r"\bcfo\b", "CFO"),
+        (r"\bfinance director\b", "Finance Director"),
+        (r"\bhead of finance\b", "Head of Finance"),
+        (r"\bvice president of finance\b", "VP Finance"),
+        (r"\bvp,? (?:of )?finance\b", "VP Finance"),
+        (r"\bsenior finance manager\b", "Senior Finance Manager"),
+        (r"\bfinance manager\b", "Finance Manager"),
+        (r"\bfinancial controller\b", "Financial Controller"),
+    ],
+}
+
+# Parole che segnalano che l'annuncio sta descrivendo il ruolo, non l'azienda.
+ROLE_WORDS = {
+    'finance', 'financial', 'director', 'head', 'vp', 'vice', 'president', 'cfo',
+    'chief', 'officer', 'manager', 'senior', 'junior', 'analyst', 'controller',
+    'role', 'position', 'job', 'team', 'company', 'vacancy', 'description',
+    'requisition', 'opportunity', 'candidate', 'profile', 'titolo', 'posizione',
+    'ruolo', 'cerca', 'cerchiamo', 'ricerca', 'assumiamo', 'stiamo',
+    'the', 'a', 'an', 'of', 'and', 'or', 'to', 'at', 'on', 'in', 'for', 'with',
+    'we', 'our', 'you', 'your', 'they', 'their', 'this', 'that', 'who', 'what',
+    'il', 'lo', 'la', 'le', 'gli', 'un', 'una', 'e', 'di', 'da', 'per', 'con',
+    'nel', 'della', 'delle', 'dei', 'del', 'siamo', 'stiamo', 'cerca',
+    'cerchiamo', 'ricerca', 'azienda', 'requisiti', 'competenze', 'esperienza',
+    'si', 'siamo', 'offriamo', 'offerta', 'settore', 'gruppo',
+    'about', 'us', 'join', 'make', 'impact', 'careers', 'career', 'great',
+    'mission', 'offer', 'full', 'time', 'part', 'permanent', 'contract',
+    'temporary', 'remote', 'hybrid', 'location', 'based', 'please', 'apply',
+    'who', 'what', 'why', 'will', 'work', 'working', 'know', 'able', 'strong',
+    # Ruoli in italiano
+    'direttore', 'direttori', 'finanziario', 'finanziaria', 'finanziari',
+    'responsabile', 'amministrativo', 'amministrativa', 'contabile',
+    'commerciale', 'qualita', 'tecnico', 'personale', 'marketing', 'gruppo',
+}
+
+# Suffissi societari: se presenti il candidato e' molto probabilmente un'azienda.
+CORPORATE_SUFFIX = re.compile(
+    r"\b(inc|ltd|llc|plc|corp|corporation|company|co|group|group|holding|"
+    r"holdings|s\.?p\.?a\.?|s\.?r\.?l\.?|b\.?v\.?|n\.?v\.?|gmbh|ag|s\.?a\.?|"
+    r"partners|technologies|solutions|services)\b",
+    re.IGNORECASE)
+
+# Sigle societarie che vanno conservate con il punto finale ("Alfa S.p.A.").
+LEGAL_FORM_RE = re.compile(
+    r"\b(s\.?p\.?a|s\.?r\.?l|b\.?v|n\.?v|inc|ltd|plc|corp)$", re.IGNORECASE)
+
+# Token che possono comporre un nome aziendale. Accetta acronimi e sigle
+# societarie come "S.p.A.", "AT&T", "BHP".
+_NAME_TOKEN = r"[A-Z][\w&'’]*(?:\.[A-Za-z][\w&'’]*)*"
+# Connettivi ammessi dentro un nome ("Bank of America", "Banca di Roma").
+# "and"/"e" sono esclusi per non unire due nomi aziendi diversi.
+# L'ordine conta: le alternative piu' lunghe vanno prima, altrimenti "dei"
+# viene letto come "de" e il nome si trappa.
+_NAME_CONNECTOR = r"(?:of|della|delle|dei|del|di|de|la|le|the)"
+_NAME_RE = re.compile(
+    r"((?:%s)(?:\s+(?:%s|%s))*)" % (_NAME_TOKEN, _NAME_TOKEN, _NAME_CONNECTOR))
+
+# Articoli da rimuovere davanti al nome ("il Gruppo ..." -> "Gruppo ...").
+_LEADING_ARTICLE_RE = re.compile(
+    r"^(?:the|il|lo|la|i|gli|le|l'|un|una|our|your)\s+", re.IGNORECASE)
+# Connettivi da rimuovere in coda ("Alfa S.p.A. e" -> "Alfa S.p.A.").
+_TRAILING_CONNECTOR_RE = re.compile(
+    r"\s+(?:of|and|de|del|di|della|dei|delle|la|le|the|e|&)$", re.IGNORECASE)
+
+# Frasi che introducono il nome dell'azienda. "at" e "presso" coprono la gran
+# parte dei casi reali; le altre sono fallback.
+EN_TRIGGERS = [r"about\s+(?:us|the\s+company)\s*:?", r"at", r"with", r"about",
+               r"join", r"from"]
+IT_TRIGGERS = [r"presso", r"da", r"per", r"di"]
+
+# Verbi che, dopo un nome, indicano che quel nome e' l'azienda
+# ("Acme Corporation is hiring...", "Banca Intesa ricerca...").
+COMPANY_VERB_RE = re.compile(
+    r"^\s*(?:is|seeks?|seeking|looking|searches|searching|has|have|offers?|"
+    r"offre|offerta|ricerca|cerca|cerchiamo|assume|sta|è|e')\b",
+    re.IGNORECASE)
+
+# Etichette esplicite: "Company: Acme", "Azienda: Initech".
+COMPANY_LABEL_RE = re.compile(
+    r"(?:^|\n|\s)(?:company|azienda|employer|datore di lavoro|organizzazione|"
+    r"societa|società|firma|business unit)\s*[:\-–]\s*(.+)",
+    re.IGNORECASE)
+
+# "The client, Swiss Re Global, is hiring..." / "Il cliente, Alfa, cerca..."
+CLIENT_LABEL_RE = re.compile(
+    r"\b(?:client|cliente|azienda|company)\s*,\s*(.+)", re.IGNORECASE)
+
+# Frasi che indicano che il titolo trovato e' il ruolo cercato.
+HIRING_CUES = re.compile(
+    r"\b(?:we are hiring|we're hiring|we are looking for|looking for|hiring|"
+    r"seeking|candidate for|role at|open position|cerchiamo|stiamo assumendo|"
+    r"si cerca|cerca un|cerca una|ricerca|ricercasi|assumiamo|offriamo un|"
+    r"posizione aperta|offerta di lavoro)\b",
+    re.IGNORECASE)
+
+
+def _clean_company(candidate):
+    """Normalizza un candidato aziendale: taglia punteggiatura finale e frasi."""
+    if not candidate:
+        return None
+    cand = candidate.strip().strip('"\'‘’“”')
+    # Taglia alla prima frase o separatore forte.
+    cand = re.split(r"[;\n\r]|(?<=[a-z0-9)])\.(?=\s)|,\s|\s+\|\s+", cand, maxsplit=1)[0]
+    # Togli articoli iniziali e connettivi finali ("il Gruppo X e" -> "Gruppo X").
+    for _ in range(3):
+        before = cand
+        cand = _LEADING_ARTICLE_RE.sub("", cand).strip()
+        cand = _TRAILING_CONNECTOR_RE.sub("", cand).strip()
+        if cand == before:
+            break
+    # Togli la punteggiatura finale, ma conserva le sigle societarie.
+    stripped = cand.rstrip(".,;:-–— \t").strip('"\'‘’“”')
+    cand = stripped
+    if LEGAL_FORM_RE.search(cand):
+        cand = cand + "."
+    if not cand:
+        return None
+    words = re.findall(r"[\w&'’.]+", cand)
+    if not words or len(words) > 6:
+        return None
+    if not (2 <= len(cand) <= 40):
+        return None
+    # Se tutte le parole sono termini di ruolo, non e' un'azienda.
+    if all(w.lower() in ROLE_WORDS for w in words):
+        return None
+    return cand
+
+
+def _company_from_trigger(text, triggers):
+    """Cerca il nome aziendale dopo un trigger ('at', 'presso', ...)."""
+    for trigger in triggers:
+        for m in re.finditer(r"\b%s\s+" % trigger, text, re.IGNORECASE):
+            rest = text[m.end():]
+            # Solo la frase corrente.
+            chunk = re.split(r"[;\n\r]|(?<=[a-z0-9)])\.(?=\s)", rest, maxsplit=1)[0]
+            # Eventuale articolo ("per il Gruppo ...").
+            chunk = _LEADING_ARTICLE_RE.sub("", chunk, count=1)
+            found = _NAME_RE.match(chunk)
+            if not found:
+                continue
+            cand = _clean_company(found.group(1))
+            if cand:
+                return cand
+    return None
+
+
+def _company_from_lead(text):
+    """Nome aziendale all'inizio della frase: "Acme Corporation is hiring..."."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Solo la prima riga utile: evita di scambiare una parola qualsiasi
+        # ("Si", "We", "Ricerca") per il nome dell'azienda.
+        found = _NAME_RE.match(line)
+        if found:
+            cand = _clean_company(found.group(1))
+            if cand and COMPANY_VERB_RE.match(line[found.end():]):
+                return cand
+        break
+    return None
+
+
+def _company_from_heading(text):
+    """Fallback: il nome dell'azienda spesso sta da solo nella prima riga."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()][:5]
+    for line in lines:
+        if not line or len(line) > 40:
+            continue
+        found = _NAME_RE.match(line)
+        if not found:
+            continue
+        cand = found.group(1).strip()
+        rest = line[found.end():].strip()
+        # La riga deve essere (quasi) solo il nome aziendale.
+        if rest and not CORPORATE_SUFFIX.match(rest):
+            continue
+        cleaned = _clean_company(cand)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def extract_company(jd_text):
+    """Estrae il nome dell'azienda dall'annuncio."""
+    # 1) Etichetta esplicita: "Company: Acme", "Azienda: Initech".
+    m = COMPANY_LABEL_RE.search(jd_text)
+    if m:
+        cand = _clean_company(m.group(1))
+        if cand:
+            return cand
+
+    # 2) "The client, Swiss Re Global, ..."
+    m = CLIENT_LABEL_RE.search(jd_text)
+    if m:
+        cand = _clean_company(m.group(1))
+        if cand:
+            return cand
+
+    # 3) Nome in testa alla frase: "Acme Corporation is hiring...".
+    cand = _company_from_lead(jd_text)
+    if cand:
+        return cand
+
+    # 4) Nome isolato in testa all'annuncio ("Banca Intesa Sanpaolo\n...").
+    cand = _company_from_heading(jd_text)
+    if cand:
+        return cand
+
+    # 5) Trigger ("at Acme", "presso Alfa S.p.A.", "About us: Globex").
+    for triggers in (EN_TRIGGERS, IT_TRIGGERS):
+        cand = _company_from_trigger(jd_text, triggers)
+        if cand:
+            return cand
+
+    return "Company"
+
+
+def extract_role(jd_text, lang):
+    """Estrae il titolo del ruolo, privilegiando il contesto di assunzione."""
+    patterns = ROLE_PATTERNS.get(lang, ROLE_PATTERNS['en'])
+
+    # 1) Etichetta esplicita: "Role: Finance Director", "Posizione: CFO".
+    labelled = re.search(
+        r"(?:role|position|title|job title|posizione|ruolo|titolo)\s*[:\-–]\s*"
+        r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ /&'’()-]{2,50})",
+        jd_text, re.IGNORECASE)
+    if labelled:
+        raw = labelled.group(1).strip(" .,\n\t")
+        for pattern, title in patterns:
+            if re.search(pattern, raw, re.IGNORECASE):
+                return title
+        if raw.lower() not in ROLE_WORDS:
+            return raw.title()
+
+    # 2/3) Ricerca nel testo, con priorità a: frasi di assunzione, poi
+    # prima occorrenza nel documento.
+    cues = [m.start() for m in HIRING_CUES.finditer(jd_text)]
+    best = None
+    for pattern, title in patterns:
+        for m in re.finditer(pattern, jd_text, re.IGNORECASE):
+            in_cue = any(0 <= (m.start() - cue) <= 60 for cue in cues)
+            key = (0 if in_cue else 1, m.start())
+            if best is None or key < best[0]:
+                best = (key, title)
+    if best:
+        return best[1]
+
+    # 4) Titolo generico in italiano per l'annuncio italiano.
+    return "Finance Director" if lang == 'en' else "Direttore Finanziario"
+
 
 def extract_info(jd_text, lang):
-    # Company Name (euristica semplice)
-    match = re.search(r'(?:About|Join|working at|presso|azienda)\s+([A-Z][a-zA-Z0-9\s\&]+?)(?:\s|\.|,)', jd_text)
-    company = match.group(1).strip() if match and len(match.group(1)) < 30 else "Company"
-    
-    # Role Title
-    role = "Finance Executive"
-    if "VP" in jd_text: role = "VP Finance"
-    if "Director" in jd_text: role = "Finance Director"
-    if "Head" in jd_text: role = "Head of Finance"
-    
-    # Characteristic (Key Value)
-    keywords = ['innovation', 'sustainability', 'leadership', 'growth', 'transformation'] if lang == 'en' else ['innovazione', 'sostenibilità', 'leadership', 'crescita', 'trasformazione']
+    company = extract_company(jd_text)
+    role = extract_role(jd_text, lang)
+
+    # Key Value: confronto senza diacritici, così "sostenibilita" (annunci
+    # scritti senza accenti) viene comunque riconosciuto.
+    keywords = (['innovation', 'sustainability', 'growth', 'transformation',
+                 'leadership'] if lang == 'en' else
+                ['innovazione', 'sostenibilità', 'crescita', 'trasformazione',
+                 'eccellenza'])
+    haystack = _norm(jd_text)
     char = "mission" if lang == 'en' else "missione"
     for k in keywords:
-        if k in jd_text.lower():
+        if _norm(k) in haystack:
             char = k
             break
-            
+
     return company, role, char
 
 def create_docs(profile, lang, company, role, char):
