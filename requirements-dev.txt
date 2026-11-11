@@ -1,0 +1,3 @@
+# Dipendenze di sviluppo (non necessarie per il deploy dell'app).
+-r requirements.txt
+pytest>=8.0
